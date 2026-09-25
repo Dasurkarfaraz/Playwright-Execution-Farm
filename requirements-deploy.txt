@@ -1,0 +1,11 @@
+# The hosted server only accepts connections, stores job state, and
+# dispatches jobs to agents/dashboards. It never launches a browser itself,
+# so it does NOT need playwright, pytest, chromium, postgres, redis, etc.
+# That's what keeps it light enough to run on a free/cheap tier.
+#
+# (Playwright + browsers live in agent/requirements.txt instead, installed
+# on the customer's own machine where the agent runs.)
+
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6

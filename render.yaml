@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: playwright-farm-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile.deploy
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000
