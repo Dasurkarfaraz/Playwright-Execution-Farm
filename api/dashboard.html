@@ -90,8 +90,29 @@
         <option value="typescript">TypeScript</option>
       </select>
     </div>
-    <div class="row">
+
+    <div class="row" style="border-bottom:1px solid #334155; padding-bottom:12px;">
+      <button class="secondary" id="tabUpload" onclick="setSourceTab('upload')">Upload zip</button>
+      <button class="secondary" id="tabGit" onclick="setSourceTab('git')">GitHub / Git repo</button>
+      <button class="secondary" id="tabLocal" onclick="setSourceTab('local')">Agent's local folder</button>
+    </div>
+
+    <div id="sourceUpload" class="row">
       <input type="file" id="testZip" accept=".zip">
+      <span class="muted">Zip is stored briefly on our server so the agent can fetch it.</span>
+    </div>
+
+    <div id="sourceGit" class="row" style="display:none;">
+      <input id="gitUrl" placeholder="https://github.com/org/repo.git" style="flex:1; min-width:260px;">
+      <input id="gitRef" placeholder="branch (default: main)" style="width:160px;">
+      <span class="muted">Code never touches our server - the agent clones it directly.</span>
+    </div>
+
+    <div id="sourceLocal" class="row" style="display:none;">
+      <span class="muted">Runs whatever's already at the <code>--local-path</code> the agent was started with. Nothing leaves the agent's machine at all.</span>
+    </div>
+
+    <div class="row">
       <button onclick="dispatchJob()">Run tests</button>
     </div>
     <div id="dispatchResult" class="muted"></div>
@@ -207,21 +228,46 @@ async function registerAgent() {
   }
 }
 
+let sourceTab = 'upload';
+function setSourceTab(tab) {
+  sourceTab = tab;
+  document.getElementById('sourceUpload').style.display = tab === 'upload' ? 'flex' : 'none';
+  document.getElementById('sourceGit').style.display = tab === 'git' ? 'flex' : 'none';
+  document.getElementById('sourceLocal').style.display = tab === 'local' ? 'flex' : 'none';
+  ['tabUpload', 'tabGit', 'tabLocal'].forEach(id => document.getElementById(id).style.background = '#334155');
+  document.getElementById('tab' + tab[0].toUpperCase() + tab.slice(1)).style.background = '#0ea5e9';
+}
+setSourceTab('upload');
+
 async function dispatchJob() {
   const agentId = document.getElementById('agentPicker').value;
   const language = document.getElementById('langPicker').value;
-  const fileInput = document.getElementById('testZip');
   const result = document.getElementById('dispatchResult');
 
   if (!agentId) { result.textContent = 'Pick an agent first.'; return; }
-  if (!fileInput.files[0]) { result.textContent = 'Choose a .zip of the test project first.'; return; }
-
-  const formData = new FormData();
-  formData.append('file', fileInput.files[0]);
 
   result.textContent = 'Dispatching...';
   try {
-    const res = await fetch(`/agents/${agentId}/run?language=${language}`, { method: 'POST', body: formData });
+    let res;
+    if (sourceTab === 'upload') {
+      const fileInput = document.getElementById('testZip');
+      if (!fileInput.files[0]) { result.textContent = 'Choose a .zip of the test project first.'; return; }
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+      res = await fetch(`/agents/${agentId}/run?language=${language}`, { method: 'POST', body: formData });
+
+    } else if (sourceTab === 'git') {
+      const repoUrl = document.getElementById('gitUrl').value.trim();
+      const ref = document.getElementById('gitRef').value.trim() || 'main';
+      if (!repoUrl) { result.textContent = 'Enter a repo URL first.'; return; }
+      const params = new URLSearchParams({ repo_url: repoUrl, ref, language });
+      res = await fetch(`/agents/${agentId}/run-git?${params}`, { method: 'POST' });
+
+    } else { // local
+      const params = new URLSearchParams({ language });
+      res = await fetch(`/agents/${agentId}/run-local?${params}`, { method: 'POST' });
+    }
+
     const data = await res.json();
     if (data.job_id) {
       result.textContent = `Dispatched as job ${data.job_id}`;

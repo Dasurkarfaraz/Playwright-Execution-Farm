@@ -41,10 +41,23 @@ class ConnectedAgent:
 
 
 class AgentJob:
-    def __init__(self, job_id: str, agent_id: str, download_url: str, language: str, command: Optional[str]):
+    """A job can come from three sources:
+    - upload: a zip the customer uploaded through the dashboard (download_url set)
+    - git: a repo URL the agent clones itself (git_url set) - your code stays
+      in the customer's own git host, never touches our server or storage
+    - local: nothing is sent at all - the agent runs whatever is already on
+      disk on the customer's machine (source == "local"). Nobody's code
+      leaves their machine in this mode.
+    """
+    def __init__(self, job_id: str, agent_id: str, language: str, command: Optional[str],
+                 download_url: Optional[str] = None, git_url: Optional[str] = None,
+                 git_ref: Optional[str] = None, source: str = "upload"):
         self.id = job_id
         self.agent_id = agent_id
         self.download_url = download_url
+        self.git_url = git_url
+        self.git_ref = git_ref
+        self.source = source
         self.language = language
         self.command = command
         self.status = "dispatched"  # dispatched | running | passed | failed
@@ -110,9 +123,13 @@ class AgentManager:
 
     # ---------- job dispatch ----------
 
-    def create_job(self, agent_id: str, download_url: str, language: str, command: Optional[str]) -> str:
+    def create_job(self, agent_id: str, language: str, command: Optional[str],
+                    download_url: Optional[str] = None, git_url: Optional[str] = None,
+                    git_ref: Optional[str] = None, source: str = "upload") -> str:
         job_id = f"job-{secrets.token_hex(4)}"
-        self.jobs[job_id] = AgentJob(job_id, agent_id, download_url, language, command)
+        self.jobs[job_id] = AgentJob(job_id, agent_id, language, command,
+                                      download_url=download_url, git_url=git_url,
+                                      git_ref=git_ref, source=source)
         return job_id
 
     async def dispatch_job(self, agent_id: str, job_id: str) -> bool:
@@ -124,13 +141,19 @@ class AgentManager:
             return False
         agent.status = "busy"
         agent.current_job_id = job_id
-        await agent.websocket.send_json({
+        payload = {
             "type": "job",
             "job_id": job.id,
-            "download_url": job.download_url,
+            "source": job.source,
             "language": job.language,
             "command": job.command,
-        })
+        }
+        if job.download_url:
+            payload["download_url"] = job.download_url
+        if job.git_url:
+            payload["git_url"] = job.git_url
+            payload["git_ref"] = job.git_ref
+        await agent.websocket.send_json(payload)
         return True
 
     # ---------- messages coming back from the agent ----------

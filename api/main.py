@@ -364,8 +364,9 @@ async def agent_socket(websocket: WebSocket, token: str):
 
 @app.post("/agents/{agent_id}/run")
 async def run_on_agent(agent_id: str, file: UploadFile = File(...), language: str = "auto", command: str = None):
-    """Step 3: dispatch a test bundle (zip of the customer's Playwright
-    project) to a specific connected agent."""
+    """Source 1 - UPLOAD: dispatch a test bundle (zip of the customer's
+    Playwright project) to a specific connected agent. The zip is stored on
+    our server briefly so the agent can download it."""
     if not agent_manager.get_agent(agent_id):
         return {"error": "agent not found or not connected"}, 404
 
@@ -374,7 +375,38 @@ async def run_on_agent(agent_id: str, file: UploadFile = File(...), language: st
     upload_handler.save_zip_file(content, filename)
     download_url = f"/agents/downloads/{filename}"
 
-    job_id = agent_manager.create_job(agent_id, download_url, language, command)
+    job_id = agent_manager.create_job(agent_id, language, command, download_url=download_url, source="upload")
+    dispatched = await agent_manager.dispatch_job(agent_id, job_id)
+    if not dispatched:
+        return {"error": "agent is busy or offline, try again shortly"}, 409
+
+    return {"job_id": job_id, "agent_id": agent_id, "status": "dispatched"}
+
+@app.post("/agents/{agent_id}/run-git")
+async def run_on_agent_from_git(agent_id: str, repo_url: str, ref: str = "main", language: str = "auto", command: str = None):
+    """Source 2 - GIT: the agent clones the repo itself. The customer's code
+    never touches our server at all - it goes straight from their git host
+    to their own machine."""
+    if not agent_manager.get_agent(agent_id):
+        return {"error": "agent not found or not connected"}, 404
+
+    job_id = agent_manager.create_job(agent_id, language, command, git_url=repo_url, git_ref=ref, source="git")
+    dispatched = await agent_manager.dispatch_job(agent_id, job_id)
+    if not dispatched:
+        return {"error": "agent is busy or offline, try again shortly"}, 409
+
+    return {"job_id": job_id, "agent_id": agent_id, "status": "dispatched"}
+
+@app.post("/agents/{agent_id}/run-local")
+async def run_on_agent_local(agent_id: str, language: str = "auto", command: str = None):
+    """Source 3 - LOCAL: nothing is sent to the agent at all. It runs
+    whatever's already sitting in the folder it was started with
+    (--local-path). This is the option for customers who don't want their
+    test code to leave their own machine, ever."""
+    if not agent_manager.get_agent(agent_id):
+        return {"error": "agent not found or not connected"}, 404
+
+    job_id = agent_manager.create_job(agent_id, language, command, source="local")
     dispatched = await agent_manager.dispatch_job(agent_id, job_id)
     if not dispatched:
         return {"error": "agent is busy or offline, try again shortly"}, 409

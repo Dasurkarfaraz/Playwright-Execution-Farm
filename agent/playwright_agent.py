@@ -6,8 +6,16 @@ Run this on YOUR OWN machine (or a machine inside your private/UAT network).
 It connects OUTBOUND to the hosted server over WebSocket, so you do not need
 to open any inbound port, configure port-forwarding, or touch a firewall.
 
-Once connected, the server can send this agent a job. The agent:
-  1. downloads the test bundle (a zip of the customer's Playwright project)
+Once connected, the server can send this agent a job, from one of three
+sources:
+  - upload: a zip uploaded through the dashboard (downloaded from the server)
+  - git: a repo URL the agent clones itself - your code goes straight from
+    your git host to this machine, never touching the server
+  - local: nothing is sent at all - runs whatever's already at --local-path
+    on this machine. Use this if you don't want code leaving the machine.
+
+For any of the three, the agent then:
+  1. gets the test project (download/clone/already-there)
   2. detects whether it's Python, JavaScript or TypeScript
   3. installs dependencies + browsers if needed
   4. runs the tests, streaming every log line back to the server live
@@ -39,11 +47,12 @@ except ImportError:
 
 
 class Agent:
-    def __init__(self, server: str, token: str, name: str):
+    def __init__(self, server: str, token: str, name: str, local_path: str = None):
         self.http_base = server.rstrip("/")
         self.ws_base = self.http_base.replace("https://", "wss://").replace("http://", "ws://")
         self.token = token
         self.name = name
+        self.local_path = Path(local_path).resolve() if local_path else None
         self.ws = None
 
     # ---------- connection lifecycle ----------
@@ -85,22 +94,48 @@ class Agent:
 
     async def _run_job(self, msg: dict):
         job_id = msg["job_id"]
-        download_url = msg["download_url"]
+        source = msg.get("source", "upload")
         language = msg.get("language", "auto")
         command = msg.get("command")
 
         workdir = Path(tempfile.mkdtemp(prefix=f"pwjob_{job_id}_"))
         try:
-            await self._log(job_id, "Downloading test bundle...")
-            zip_path = workdir / "bundle.zip"
-            resp = requests.get(f"{self.http_base}{download_url}", timeout=60)
-            resp.raise_for_status()
-            zip_path.write_bytes(resp.content)
+            if source == "local":
+                if not self.local_path or not self.local_path.exists():
+                    await self._log(job_id, f"ERROR: this agent was not started with --local-path, "
+                                             f"or the path doesn't exist ({self.local_path})")
+                    await self._send({"type": "result", "job_id": job_id, "status": "failed", "exit_code": -1})
+                    return
+                await self._log(job_id, f"Using local test folder: {self.local_path}")
+                src = self.local_path  # never touched/deleted - it's the customer's own folder
 
-            src = workdir / "src"
-            src.mkdir()
-            with zipfile.ZipFile(zip_path) as z:
-                z.extractall(src)
+            elif source == "git":
+                git_url = msg["git_url"]
+                git_ref = msg.get("git_ref") or "main"
+                await self._log(job_id, f"Cloning {git_url} ({git_ref})...")
+                src = workdir / "src"
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "clone", "--depth", "1", "--branch", git_ref, git_url, str(src),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                out, _ = await proc.communicate()
+                if proc.returncode != 0:
+                    await self._log(job_id, out.decode(errors="replace"))
+                    await self._send({"type": "result", "job_id": job_id, "status": "failed", "exit_code": proc.returncode})
+                    return
+
+            else:  # "upload" - default, existing behavior
+                download_url = msg["download_url"]
+                await self._log(job_id, "Downloading test bundle...")
+                zip_path = workdir / "bundle.zip"
+                resp = requests.get(f"{self.http_base}{download_url}", timeout=60)
+                resp.raise_for_status()
+                zip_path.write_bytes(resp.content)
+
+                src = workdir / "src"
+                src.mkdir()
+                with zipfile.ZipFile(zip_path) as z:
+                    z.extractall(src)
 
             detected = language if language and language != "auto" else self._detect_language(src)
             await self._log(job_id, f"Detected project type: {detected}")
@@ -127,6 +162,8 @@ class Agent:
             await self._send({"type": "result", "job_id": job_id, "status": "failed", "exit_code": -1})
             await self._log(job_id, f"ERROR: {e}")
         finally:
+            # workdir is always our own temp scratch dir, never the customer's
+            # --local-path folder, so this is always safe to delete.
             shutil.rmtree(workdir, ignore_errors=True)
 
     # ---------- language detection + setup ----------
@@ -220,9 +257,12 @@ def main():
     parser.add_argument("--server", required=True, help="e.g. https://your-app.up.railway.app")
     parser.add_argument("--token", required=True, help="token from POST /agents/register")
     parser.add_argument("--name", default="local-agent", help="display name for this agent")
+    parser.add_argument("--local-path", default=None,
+                         help="folder on THIS machine that already has the Playwright project. "
+                              "Required only if you'll dispatch 'local' jobs (code never leaves this machine).")
     args = parser.parse_args()
 
-    agent = Agent(args.server, args.token, args.name)
+    agent = Agent(args.server, args.token, args.name, local_path=args.local_path)
     try:
         asyncio.run(agent.run_forever())
     except KeyboardInterrupt:
