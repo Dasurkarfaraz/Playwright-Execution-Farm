@@ -1,0 +1,5 @@
+# Install these ON TOP OF requirements-deploy.txt only if you're enabling
+# the browser grid feature (customers connecting their own scripts via
+# wsEndpoint). The lean dispatcher server does NOT need these.
+playwright==1.40.0
+websockets>=12.0

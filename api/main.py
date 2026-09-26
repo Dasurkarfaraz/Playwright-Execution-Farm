@@ -1,15 +1,26 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 import uuid
 from worker.job_manager import job_manager, JobStatus
 from worker.pool_manager import pool_manager
 from api.upload_handler import upload_handler
 from api.tunnel_manager import tunnel_manager, tunnel_config
 from api.agent_manager import agent_manager
+try:
+    from api.browser_manager import browser_grid, parse_capabilities, resolve_browser, relay
+    BROWSER_GRID_AVAILABLE = True
+except ImportError:
+    # playwright isn't installed - normal for the lean/free dispatcher deploy.
+    # The /agents and /browser-keys... endpoints below still register, but
+    # the actual /playwright websocket will return a clear error instead of
+    # crashing the whole app on boot. See BROWSER_GRID.md.
+    BROWSER_GRID_AVAILABLE = False
 import asyncio
 import json
 import os
+import secrets
 
 app = FastAPI(title="Playwright Execution Farm V2-V10")
 
@@ -24,27 +35,58 @@ app.add_middleware(
 
 # ==================== PHASE 1: Basic Endpoints ====================
 
+app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+
+def _serve_page(filename: str):
+    path = os.path.join(os.path.dirname(__file__), filename)
+    if os.path.exists(path):
+        with open(path) as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content=f"<h1>{filename} not found</h1>", status_code=404)
+
+# ==================== PHASE 1: Basic Endpoints ====================
+
 @app.get("/")
 async def home():
-    """Redirect to dashboard"""
-    dashboard_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
-    if os.path.exists(dashboard_path):
-        with open(dashboard_path) as f:
-            return HTMLResponse(content=f.read())
-    return {
-        "message": "Playwright Execution Farm",
-        "version": "2.0",
-        "phases": "1-10 implemented"
-    }
+    """Marketing homepage."""
+    return _serve_page("index.html")
 
 @app.get("/dashboard")
 async def dashboard():
-    """Serve dashboard UI"""
-    dashboard_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
-    if os.path.exists(dashboard_path):
-        with open(dashboard_path) as f:
-            return HTMLResponse(content=f.read())
-    return {"error": "Dashboard not found"}, 404
+    """Serve the app dashboard (register agents, dispatch jobs, watch logs)."""
+    return _serve_page("dashboard.html")
+
+@app.get("/pricing")
+async def pricing_page():
+    return _serve_page("pricing.html")
+
+@app.get("/about")
+async def about_page():
+    return _serve_page("about.html")
+
+@app.get("/careers")
+async def careers_page():
+    return _serve_page("careers.html")
+
+@app.get("/terms")
+async def terms_page():
+    return _serve_page("terms.html")
+
+@app.get("/privacy")
+async def privacy_page():
+    return _serve_page("privacy.html")
+
+@app.get("/login")
+async def login_page():
+    return _serve_page("login.html")
+
+@app.get("/signup")
+async def signup_page():
+    return _serve_page("signup.html")
+
+@app.get("/reset-password")
+async def reset_password_page():
+    return _serve_page("reset-password.html")
 
 @app.get("/health")
 def health():
@@ -311,6 +353,81 @@ def set_tunnel_config(provider: str, auth_token: str = None):
 def get_tunnel_config():
     """Get tunnel config (Phase 5-V5)"""
     return tunnel_config.to_dict()
+
+# ==================== BROWSER GRID (customer's own script connects via wsEndpoint) ====================
+#
+# Different from the /agents flow above: here the CUSTOMER keeps writing and
+# running their own Playwright scripts (their own CI, their own laptop), and
+# just points `chromium.connect({ wsEndpoint })` at us instead of running a
+# browser themselves. We launch the real browser here and relay the wire
+# protocol through. See api/browser_manager.py and BROWSER_GRID.md.
+
+@app.post("/browser-keys")
+def issue_browser_access_key(user: str, name: str = ""):
+    """Give this (user, access_key) pair to the customer. They put it in
+    their script's capabilities, same shape as the sample you were given."""
+    if not BROWSER_GRID_AVAILABLE:
+        return {"error": "browser grid not enabled on this deployment - see BROWSER_GRID.md"}, 503
+    access_key = browser_grid.issue_access_key(user, name)
+    return {
+        "user": user,
+        "access_key": access_key,
+        "note": "Put these into capabilities['PWFarm:Options'] = {'user': ..., 'accessKey': ...} "
+                "in the customer's script, and point wsEndpoint at "
+                "wss://<this-server>/playwright?capabilities=<url-encoded json>"
+    }
+
+@app.get("/browser-keys")
+def list_browser_access_keys():
+    if not BROWSER_GRID_AVAILABLE:
+        return {"error": "browser grid not enabled on this deployment - see BROWSER_GRID.md"}, 503
+    return {"keys": browser_grid.list_access_keys()}
+
+@app.get("/browser-sessions")
+def list_browser_sessions():
+    """Live sessions currently running - useful for a dashboard 'active now' view."""
+    if not BROWSER_GRID_AVAILABLE:
+        return {"error": "browser grid not enabled on this deployment - see BROWSER_GRID.md"}, 503
+    return {"sessions": browser_grid.list_sessions()}
+
+@app.websocket("/playwright")
+async def playwright_connect(websocket: WebSocket):
+    if not BROWSER_GRID_AVAILABLE:
+        await websocket.close(code=1011, reason="browser grid not enabled on this deployment")
+        return
+
+    capabilities = parse_capabilities(websocket.query_params.get("capabilities"))
+    options = capabilities.get("PWFarm:Options", {})
+    user = options.get("user")
+    access_key = options.get("accessKey")
+
+    if not user or not access_key or not browser_grid.validate(user, access_key):
+        await websocket.close(code=4401)  # policy violation / unauthorized
+        return
+
+    await websocket.accept()
+
+    browser_name, channel = resolve_browser(capabilities.get("browserName", "chromium"))
+    session_id = f"sess-{secrets.token_hex(4)}"
+
+    try:
+        server = await browser_grid.launch_browser_server(browser_name, channel)
+    except Exception as e:
+        await websocket.send_text(json.dumps({"error": f"could not launch {browser_name}: {e}"}))
+        await websocket.close(code=1011)
+        return
+
+    browser_grid.register_session(session_id, user, browser_name, {
+        "build": options.get("build"), "name": options.get("name"),
+    })
+    try:
+        await relay(websocket, server.ws_endpoint)
+    finally:
+        browser_grid.end_session(session_id)
+        try:
+            await server.close()
+        except Exception:
+            pass
 
 # ==================== LOCAL EXECUTION AGENTS (real tunneling) ====================
 #
